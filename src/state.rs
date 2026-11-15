@@ -12,6 +12,7 @@ use teloxide::types::ChatId;
 
 use crate::{
     config::Config,
+    data::PersistentStore,
     models::{Beat, PreviewInfo},
 };
 
@@ -25,16 +26,20 @@ pub enum SearchRequest {
 pub enum ConversationState {
     #[default]
     Home,
+
     WaitingForQuery {
         message_id: i32,
     },
+
     Searching {
         request_id: u64,
         message_id: i32,
     },
+
     ShowingResults {
         message_id: i32,
     },
+
     Error {
         request: SearchRequest,
         message_id: i32,
@@ -46,18 +51,24 @@ pub struct AppState {
     pub http: Client,
     pub site_url: String,
 
+    persistent: PersistentStore,
+
     conversations: Arc<Mutex<HashMap<i64, ConversationState>>>,
+
     preview_cache: Arc<Mutex<HashMap<String, PreviewInfo>>>,
+
     active_previews: Arc<Mutex<HashSet<(i64, String)>>>,
 
-    telegram_file_ids: Arc<Mutex<HashMap<String, String>>>,
     results: Arc<Mutex<HashMap<i64, (Vec<Beat>, usize)>>>,
+
     result_message_ids: Arc<Mutex<HashMap<i64, Vec<i32>>>>,
 
     result_message_is_photo: Arc<Mutex<HashMap<i64, bool>>>,
+
     preview_message_ids: Arc<Mutex<HashMap<i64, i32>>>,
 
     search_attempts: Arc<Mutex<HashMap<i64, VecDeque<Instant>>>>,
+
     preview_attempts: Arc<Mutex<HashMap<i64, VecDeque<Instant>>>>,
 
     next_request_id: Arc<AtomicU64>,
@@ -69,22 +80,83 @@ impl AppState {
             .build_http_client()
             .expect("Failed to build HTTP client");
 
-        Self {
+        let persistent = PersistentStore::from_env();
+
+        let mut conversations = HashMap::new();
+        let mut results = HashMap::new();
+        let mut result_message_ids = HashMap::new();
+        let mut result_message_is_photo = HashMap::new();
+        let mut preview_message_ids = HashMap::new();
+
+        let snapshots = persistent.carousels();
+
+        let mut restored_beats = Vec::new();
+
+        for (chat_id, snapshot) in &snapshots {
+            if snapshot.beats.is_empty() {
+                persistent.remove_carousel(*chat_id);
+                continue;
+            }
+
+            let Some(message_id) = snapshot.message_id else {
+                // An unfinished carousel must not be restored.
+                persistent.remove_carousel(*chat_id);
+                continue;
+            };
+
+            let index = snapshot.index.min(snapshot.beats.len() - 1);
+
+            results.insert(*chat_id, (snapshot.beats.clone(), index));
+
+            result_message_ids.insert(*chat_id, vec![message_id]);
+
+            result_message_is_photo.insert(*chat_id, snapshot.is_photo);
+
+            if let Some(preview_id) = snapshot.preview_message_id {
+                preview_message_ids.insert(*chat_id, preview_id);
+            }
+
+            conversations.insert(*chat_id, ConversationState::ShowingResults { message_id });
+
+            restored_beats.extend(snapshot.beats.clone());
+        }
+
+        let state = Self {
             http,
             site_url: config.site_url,
-            conversations: Arc::new(Mutex::new(HashMap::new())),
+
+            persistent,
+
+            conversations: Arc::new(Mutex::new(conversations)),
+
             preview_cache: Arc::new(Mutex::new(HashMap::new())),
+
             active_previews: Arc::new(Mutex::new(HashSet::new())),
-            telegram_file_ids: Arc::new(Mutex::new(HashMap::new())),
-            results: Arc::new(Mutex::new(HashMap::new())),
-            result_message_ids: Arc::new(Mutex::new(HashMap::new())),
-            result_message_is_photo: Arc::new(Mutex::new(HashMap::new())),
-            preview_message_ids: Arc::new(Mutex::new(HashMap::new())),
+
+            results: Arc::new(Mutex::new(results)),
+
+            result_message_ids: Arc::new(Mutex::new(result_message_ids)),
+
+            result_message_is_photo: Arc::new(Mutex::new(result_message_is_photo)),
+
+            preview_message_ids: Arc::new(Mutex::new(preview_message_ids)),
+
             search_attempts: Arc::new(Mutex::new(HashMap::new())),
+
             preview_attempts: Arc::new(Mutex::new(HashMap::new())),
+
             next_request_id: Arc::new(AtomicU64::new(1)),
-        }
+        };
+
+        // Rebuild in-memory preview metadata for restored carousels.
+        state.cache_beat_previews(&restored_beats);
+
+        state
     }
+
+    // ----------------------------------------
+    // CONVERSATION STATE
+    // ----------------------------------------
 
     pub fn get_state(&self, chat_id: ChatId) -> ConversationState {
         self.conversations
@@ -105,6 +177,7 @@ impl AppState {
     pub fn current_message_id(&self, chat_id: ChatId) -> Option<i32> {
         match self.get_state(chat_id) {
             ConversationState::Home => None,
+
             ConversationState::WaitingForQuery { message_id }
             | ConversationState::ShowingResults { message_id }
             | ConversationState::Error { message_id, .. }
@@ -196,6 +269,7 @@ impl AppState {
                 request,
                 message_id,
             } => (request, message_id),
+
             _ => return None,
         };
 
@@ -311,22 +385,234 @@ impl AppState {
     // ----------------------------------------
 
     pub fn get_telegram_file_id(&self, beat_id: &str, preview_url: &str) -> Option<String> {
-        let cache_key = format!("{}|{}", beat_id, preview_url);
-
-        self.telegram_file_ids.lock().ok()?.get(&cache_key).cloned()
+        self.persistent.get_telegram_file_id(beat_id, preview_url)
     }
 
     pub fn set_telegram_file_id(&self, beat_id: &str, preview_url: &str, file_id: String) {
-        let cache_key = format!("{}|{}", beat_id, preview_url);
+        self.persistent
+            .set_telegram_file_id(beat_id, preview_url, file_id);
+    }
 
-        if let Ok(mut cache) = self.telegram_file_ids.lock() {
-            if cache.len() >= 1000 && !cache.contains_key(&cache_key) {
-                if let Some(key) = cache.keys().next().cloned() {
-                    cache.remove(&key);
+    // ----------------------------------------
+    // FAVORITES
+    // ----------------------------------------
+
+    pub fn favorites(&self, chat_id: ChatId) -> Vec<Beat> {
+        self.persistent.favorites(chat_id.0)
+    }
+
+    pub fn is_favorite(&self, chat_id: ChatId, beat_id: &str) -> bool {
+        self.persistent.is_favorite(chat_id.0, beat_id)
+    }
+
+    pub fn toggle_favorite(&self, chat_id: ChatId, beat: Beat) -> bool {
+        self.persistent.toggle_favorite(chat_id.0, beat)
+    }
+
+    pub fn is_favorites_view(&self, chat_id: ChatId) -> bool {
+        self.persistent.is_favorites_view(chat_id.0)
+    }
+
+    /// Creates a recommendation prompt using the user's saved beats.
+    /// It uses the existing /api/recommend endpoint.
+    pub fn personalized_query(&self, chat_id: ChatId) -> Option<String> {
+        let favorites = self.favorites(chat_id);
+
+        if favorites.is_empty() {
+            return None;
+        }
+
+        let mut genre_counts: HashMap<String, usize> = HashMap::new();
+
+        for beat in &favorites {
+            if let Some(genre) = beat.genre.as_deref() {
+                let genre = genre.trim();
+
+                if !genre.is_empty() {
+                    *genre_counts.entry(genre.to_string()).or_default() += 1;
                 }
             }
+        }
 
-            cache.insert(cache_key, file_id);
+        let mut genres: Vec<(String, usize)> = genre_counts.into_iter().collect();
+
+        genres.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let preferred_genres = if genres.is_empty() {
+            "Use the saved beat references to infer the user's preferences.".to_string()
+        } else {
+            genres
+                .iter()
+                .take(5)
+                .map(|(genre, _)| genre.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let examples = favorites
+            .iter()
+            .take(5)
+            .map(|beat| {
+                let title = beat.title.as_deref().unwrap_or("Untitled");
+                let producer = beat.producer_username.as_deref().unwrap_or("Unknown");
+
+                format!("{} by {}", title, producer)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        Some(format!(
+            "Recommend new beats based on my saved favorites. \
+             My preferred genres include: {}. \
+             Some beats I saved: {}. \
+             Find new beats with similar musical characteristics, \
+             but do not simply return the exact same saved beats.",
+            preferred_genres, examples
+        ))
+    }
+
+    // ----------------------------------------
+    // PERSISTENT CAROUSEL
+    // ----------------------------------------
+
+    pub fn set_results(&self, chat_id: ChatId, beats: Vec<Beat>) {
+        self.set_results_with_mode(chat_id, beats, false);
+    }
+
+    pub fn set_favorite_results(&self, chat_id: ChatId, beats: Vec<Beat>) {
+        self.set_results_with_mode(chat_id, beats, true);
+    }
+
+    fn set_results_with_mode(&self, chat_id: ChatId, beats: Vec<Beat>, favorites_view: bool) {
+        self.persistent
+            .save_carousel(chat_id.0, beats.clone(), favorites_view);
+
+        if let Ok(mut results) = self.results.lock() {
+            results.insert(chat_id.0, (beats, 0));
+        }
+    }
+
+    pub fn current_result(&self, chat_id: ChatId) -> Option<(Beat, usize, usize)> {
+        let results = self.results.lock().ok()?;
+        let (beats, index) = results.get(&chat_id.0)?;
+
+        let total = beats.len();
+        let beat = beats.get(*index)?.clone();
+
+        Some((beat, *index, total))
+    }
+
+    pub fn move_result(&self, chat_id: ChatId, direction: i32) -> Option<(Beat, usize, usize)> {
+        let mut results = self.results.lock().ok()?;
+        let (beats, index) = results.get_mut(&chat_id.0)?;
+
+        let total = beats.len();
+
+        let next_index = carousel_index(*index, total, direction)?;
+
+        *index = next_index;
+
+        self.persistent.update_carousel_index(chat_id.0, *index);
+
+        Some((beats.get(*index)?.clone(), *index, total))
+    }
+
+    pub fn take_result_message_ids(&self, chat_id: ChatId) -> Vec<i32> {
+        let ids = self
+            .result_message_ids
+            .lock()
+            .ok()
+            .and_then(|mut all| all.remove(&chat_id.0))
+            .unwrap_or_default();
+
+        self.persistent.set_carousel_message_id(chat_id.0, None);
+
+        ids
+    }
+
+    pub fn set_result_message_ids(&self, chat_id: ChatId, ids: Vec<i32>) {
+        let message_id = ids.first().copied();
+
+        if let Ok(mut all) = self.result_message_ids.lock() {
+            all.insert(chat_id.0, ids);
+        }
+
+        self.persistent
+            .set_carousel_message_id(chat_id.0, message_id);
+    }
+
+    pub fn is_current_result_message(&self, chat_id: ChatId, message_id: i32) -> bool {
+        self.result_message_ids
+            .lock()
+            .ok()
+            .and_then(|all| all.get(&chat_id.0).cloned())
+            .map(|ids| ids.contains(&message_id))
+            .unwrap_or(false)
+    }
+
+    pub fn set_result_message_is_photo(&self, chat_id: ChatId, is_photo: bool) {
+        if let Ok(mut all) = self.result_message_is_photo.lock() {
+            all.insert(chat_id.0, is_photo);
+        }
+
+        self.persistent.set_carousel_photo(chat_id.0, is_photo);
+    }
+
+    pub fn result_message_is_photo(&self, chat_id: ChatId) -> bool {
+        self.result_message_is_photo
+            .lock()
+            .ok()
+            .and_then(|all| all.get(&chat_id.0).copied())
+            .unwrap_or(false)
+    }
+
+    pub fn clear_results(&self, chat_id: ChatId) {
+        if let Ok(mut results) = self.results.lock() {
+            results.remove(&chat_id.0);
+        }
+
+        self.persistent.remove_carousel(chat_id.0);
+    }
+
+    // ----------------------------------------
+    // ACTIVE PREVIEW MESSAGE
+    // ----------------------------------------
+
+    pub fn set_preview_message_id(&self, chat_id: ChatId, message_id: i32) {
+        if let Ok(mut all) = self.preview_message_ids.lock() {
+            all.insert(chat_id.0, message_id);
+        }
+
+        self.persistent
+            .set_preview_message_id(chat_id.0, Some(message_id));
+    }
+
+    pub fn take_preview_message_id(&self, chat_id: ChatId) -> Option<i32> {
+        let message_id = self
+            .preview_message_ids
+            .lock()
+            .ok()
+            .and_then(|mut all| all.remove(&chat_id.0));
+
+        self.persistent.set_preview_message_id(chat_id.0, None);
+
+        message_id
+    }
+
+    // ----------------------------------------
+    // ACTIVE PREVIEW LOCK
+    // ----------------------------------------
+
+    pub fn begin_preview(&self, chat_id: ChatId, beat_id: &str) -> bool {
+        self.active_previews
+            .lock()
+            .expect("Preview lock poisoned")
+            .insert((chat_id.0, beat_id.to_string()))
+    }
+
+    pub fn finish_preview(&self, chat_id: ChatId, beat_id: &str) {
+        if let Ok(mut active) = self.active_previews.lock() {
+            active.remove(&(chat_id.0, beat_id.to_string()));
         }
     }
 
@@ -384,125 +670,51 @@ impl AppState {
 
         Ok(())
     }
+}
 
-    // ----------------------------------------
-    // PAGINATION
-    // ----------------------------------------
+// ----------------------------------------
+// CAROUSEL INDEX LOGIC
+// ----------------------------------------
 
-    // ----------------------------------------
-    // BEAT CAROUSEL
-    // ----------------------------------------
-
-    pub fn set_results(&self, chat_id: ChatId, beats: Vec<Beat>) {
-        if let Ok(mut results) = self.results.lock() {
-            results.insert(chat_id.0, (beats, 0));
-        }
+fn carousel_index(current: usize, total: usize, direction: i32) -> Option<usize> {
+    if total < 2 || current >= total {
+        return None;
     }
 
-    pub fn current_result(&self, chat_id: ChatId) -> Option<(Beat, usize, usize)> {
-        let results = self.results.lock().ok()?;
-        let (beats, index) = results.get(&chat_id.0)?;
+    Some(if direction < 0 {
+        if current == 0 { total - 1 } else { current - 1 }
+    } else {
+        (current + 1) % total
+    })
+}
 
-        let total = beats.len();
-        let beat = beats.get(*index)?.clone();
+#[cfg(test)]
+mod tests {
+    use super::carousel_index;
 
-        Some((beat, *index, total))
+    #[test]
+    fn next_wraps_from_last_to_first() {
+        assert_eq!(carousel_index(4, 5, 1), Some(0));
     }
 
-    /// Move through search results as a circular carousel.
-    pub fn move_result(&self, chat_id: ChatId, direction: i32) -> Option<(Beat, usize, usize)> {
-        let mut results = self.results.lock().ok()?;
-        let (beats, index) = results.get_mut(&chat_id.0)?;
-
-        let total = beats.len();
-
-        if total < 2 {
-            return None;
-        }
-
-        *index = if direction < 0 {
-            if *index == 0 { total - 1 } else { *index - 1 }
-        } else {
-            (*index + 1) % total
-        };
-
-        Some((beats.get(*index)?.clone(), *index, total))
+    #[test]
+    fn previous_wraps_from_first_to_last() {
+        assert_eq!(carousel_index(0, 5, -1), Some(4));
     }
 
-    pub fn take_result_message_ids(&self, chat_id: ChatId) -> Vec<i32> {
-        self.result_message_ids
-            .lock()
-            .ok()
-            .and_then(|mut all| all.remove(&chat_id.0))
-            .unwrap_or_default()
+    #[test]
+    fn normal_next_and_previous_work() {
+        assert_eq!(carousel_index(1, 5, 1), Some(2));
+        assert_eq!(carousel_index(2, 5, -1), Some(1));
     }
 
-    pub fn set_result_message_ids(&self, chat_id: ChatId, ids: Vec<i32>) {
-        if let Ok(mut all) = self.result_message_ids.lock() {
-            all.insert(chat_id.0, ids);
-        }
+    #[test]
+    fn one_item_has_no_navigation() {
+        assert_eq!(carousel_index(0, 1, 1), None);
     }
 
-    pub fn is_current_result_message(&self, chat_id: ChatId, message_id: i32) -> bool {
-        self.result_message_ids
-            .lock()
-            .ok()
-            .and_then(|all| all.get(&chat_id.0).cloned())
-            .map(|ids| ids.contains(&message_id))
-            .unwrap_or(false)
-    }
-
-    pub fn set_result_message_is_photo(&self, chat_id: ChatId, is_photo: bool) {
-        if let Ok(mut all) = self.result_message_is_photo.lock() {
-            all.insert(chat_id.0, is_photo);
-        }
-    }
-
-    pub fn result_message_is_photo(&self, chat_id: ChatId) -> bool {
-        self.result_message_is_photo
-            .lock()
-            .ok()
-            .and_then(|all| all.get(&chat_id.0).copied())
-            .unwrap_or(false)
-    }
-
-    pub fn clear_results(&self, chat_id: ChatId) {
-        if let Ok(mut results) = self.results.lock() {
-            results.remove(&chat_id.0);
-        }
-    }
-
-    // ----------------------------------------
-    // ACTIVE PREVIEW MESSAGE
-    // ----------------------------------------
-
-    pub fn set_preview_message_id(&self, chat_id: ChatId, message_id: i32) {
-        if let Ok(mut all) = self.preview_message_ids.lock() {
-            all.insert(chat_id.0, message_id);
-        }
-    }
-
-    pub fn take_preview_message_id(&self, chat_id: ChatId) -> Option<i32> {
-        self.preview_message_ids
-            .lock()
-            .ok()
-            .and_then(|mut all| all.remove(&chat_id.0))
-    }
-
-    // ----------------------------------------
-    // ACTIVE PREVIEW LOCK
-    // ----------------------------------------
-
-    pub fn begin_preview(&self, chat_id: ChatId, beat_id: &str) -> bool {
-        self.active_previews
-            .lock()
-            .expect("Preview lock poisoned")
-            .insert((chat_id.0, beat_id.to_string()))
-    }
-
-    pub fn finish_preview(&self, chat_id: ChatId, beat_id: &str) {
-        if let Ok(mut active) = self.active_previews.lock() {
-            active.remove(&(chat_id.0, beat_id.to_string()));
-        }
+    #[test]
+    fn invalid_index_is_rejected() {
+        assert_eq!(carousel_index(5, 5, 1), None);
     }
 }
