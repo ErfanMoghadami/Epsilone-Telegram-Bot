@@ -13,6 +13,14 @@ pub fn main_keyboard(site_url: &str) -> InlineKeyboardMarkup {
             "🔥 Trending Beats",
             "trending",
         )],
+        vec![InlineKeyboardButton::callback(
+            "⭐ Favorite Beats",
+            "favorites",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "✨ Personalized for You",
+            "personalized",
+        )],
         vec![InlineKeyboardButton::url(
             "🌐 Visit Epsilone ↗",
             website_url,
@@ -58,6 +66,7 @@ pub fn carousel_keyboard(
     beat_url: &str,
     has_preview: bool,
     can_navigate: bool,
+    is_favorite: bool,
 ) -> InlineKeyboardMarkup {
     let url = Url::parse(beat_url).expect("Invalid beat URL");
 
@@ -82,6 +91,17 @@ pub fn carousel_keyboard(
     if !navigation.is_empty() {
         rows.push(navigation);
     }
+
+    let favorite_label = if is_favorite {
+        "💔 Remove Favorite"
+    } else {
+        "❤️ Add to Favorites"
+    };
+
+    rows.push(vec![InlineKeyboardButton::callback(
+        favorite_label,
+        "favorite:toggle",
+    )]);
 
     rows.push(vec![InlineKeyboardButton::url(
         "🛒 View / Buy on Epsilone ↗",

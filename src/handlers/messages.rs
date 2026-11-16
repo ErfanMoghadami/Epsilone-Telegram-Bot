@@ -36,6 +36,83 @@ pub async fn message_handler(bot: teloxide::Bot, msg: Message, state: AppState) 
     // COMMANDS
     // ----------------------------------------
 
+    // ----------------------------------------
+    // PRODUCER TELEGRAM LINK
+    // ----------------------------------------
+
+    if command == "/link" || command.starts_with("/link@") {
+        // Linking is allowed only in private chats.
+        if chat_id.0 <= 0 {
+            bot.send_message(
+                chat_id,
+                "برای اتصال حساب Producer، لطفاً وارد چت خصوصی ربات شو.",
+            )
+            .send()
+            .await?;
+
+            return Ok(());
+        }
+
+        if state
+            .notifications
+            .producer_id_for_chat(chat_id.0)
+            .is_some()
+        {
+            bot.send_message(
+                chat_id,
+                "✅ حساب Producer تو قبلاً به تلگرام متصل شده.\n\nبرای قطع اتصال از /unlink استفاده کن.",
+            )
+            .send()
+            .await?;
+
+            return Ok(());
+        }
+
+        let code = state.notifications.issue_link_code(chat_id.0);
+
+        bot.send_message(
+            chat_id,
+            format!(
+                "🔗 کد اتصال تلگرام:\n\n\
+                <code>{}</code>\n\n\
+                این کد ۱۰ دقیقه اعتبار داره و فقط یک‌بار قابل استفاده است.\n\n\
+                وارد پنل Producer در Epsilone شو و کد رو در بخش اتصال Telegram وارد کن.",
+                code
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .send()
+        .await?;
+
+        return Ok(());
+    }
+
+    // ----------------------------------------
+    // PRODUCER TELEGRAM UNLINK
+    // ----------------------------------------
+
+    if command == "/unlink" || command.starts_with("/unlink@") {
+        if chat_id.0 <= 0 {
+            return Ok(());
+        }
+
+        match state.notifications.unlink_chat(chat_id.0) {
+            Some(_) => {
+                bot.send_message(chat_id, "✅ اتصال حساب Producer از تلگرام قطع شد.")
+                    .send()
+                    .await?;
+            }
+
+            None => {
+                bot.send_message(chat_id, "این حساب تلگرام به هیچ Producer متصل نیست.")
+                    .send()
+                    .await?;
+            }
+        }
+
+        return Ok(());
+    }
+
     if command == "/start"
         || command.starts_with("/start@")
         || command == "/menu"

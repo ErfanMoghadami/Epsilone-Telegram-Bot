@@ -305,6 +305,334 @@ impl PersistentStore {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PendingProducerLink {
+    chat_id: i64,
+    expires_at: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ProducerNotificationData {
+    #[serde(default)]
+    pending_links: HashMap<String, PendingProducerLink>,
+
+    #[serde(default)]
+    producer_chats: HashMap<String, i64>,
+
+    #[serde(default)]
+    processed_events: HashMap<String, u64>,
+}
+
+#[derive(Clone)]
+pub struct ProducerNotificationStore {
+    inner: Arc<Mutex<ProducerNotificationData>>,
+    path: Arc<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkClaimError {
+    InvalidProducerId,
+    InvalidOrExpiredCode,
+    ExpiredCode,
+    ProducerAlreadyLinked,
+    ChatAlreadyLinked,
+}
+
+impl ProducerNotificationStore {
+    const LINK_TTL_SECONDS: u64 = 600;
+    const EVENT_RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
+    const MAX_PROCESSED_EVENTS: usize = 20_000;
+
+    pub fn from_env() -> Self {
+        let path = env::var("TELEGRAM_NOTIFICATION_STATE_FILE")
+            .unwrap_or_else(|_| "data/producer-notifications.json".to_string());
+
+        Self::open(PathBuf::from(path))
+    }
+
+    pub fn open(path: PathBuf) -> Self {
+        let mut data = if path.exists() {
+            fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ProducerNotificationData>(&bytes).ok())
+                .unwrap_or_else(|| {
+                    log::error!("Producer notification state is invalid. Starting empty.");
+
+                    ProducerNotificationData::default()
+                })
+        } else {
+            ProducerNotificationData::default()
+        };
+
+        let now = unix_timestamp();
+
+        data.pending_links.retain(|_, link| link.expires_at > now);
+
+        data.processed_events
+            .retain(|_, timestamp| now.saturating_sub(*timestamp) <= Self::EVENT_RETENTION_SECONDS);
+
+        Self {
+            inner: Arc::new(Mutex::new(data)),
+            path: Arc::new(path),
+        }
+    }
+
+    fn persist_locked(&self, data: &ProducerNotificationData) {
+        let result = (|| -> std::io::Result<()> {
+            if let Some(parent) = self.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+
+            let json = serde_json::to_vec_pretty(data)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+            let temp = self.path.with_extension("tmp");
+            let backup = self.path.with_extension("bak");
+
+            fs::write(&temp, json)?;
+
+            if self.path.exists() {
+                if backup.exists() {
+                    fs::remove_file(&backup)?;
+                }
+
+                fs::rename(&*self.path, &backup)?;
+
+                if let Err(error) = fs::rename(&temp, &*self.path) {
+                    let _ = fs::rename(&backup, &*self.path);
+                    return Err(error);
+                }
+
+                let _ = fs::remove_file(backup);
+            } else {
+                fs::rename(temp, &*self.path)?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            log::error!("Failed to persist producer notifications: {}", error);
+        }
+    }
+
+    fn update<R>(&self, operation: impl FnOnce(&mut ProducerNotificationData) -> R) -> R {
+        let mut data = self
+            .inner
+            .lock()
+            .expect("Producer notification lock poisoned");
+
+        let result = operation(&mut data);
+
+        self.persist_locked(&data);
+
+        result
+    }
+
+    // ----------------------------------------
+    // LINK CODE GENERATION
+    // ----------------------------------------
+
+    pub fn issue_link_code(&self, chat_id: i64) -> String {
+        use rand::RngCore;
+
+        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+        let now = unix_timestamp();
+
+        self.update(|data| {
+            data.pending_links
+                .retain(|_, pending| pending.chat_id != chat_id && pending.expires_at > now);
+
+            let mut rng = rand::rngs::OsRng;
+
+            let code = loop {
+                let mut bytes = [0u8; 10];
+                rng.fill_bytes(&mut bytes);
+
+                let generated: String = bytes
+                    .iter()
+                    .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
+                    .collect();
+
+                let hash = hash_link_code(&generated);
+
+                if !data.pending_links.contains_key(&hash) {
+                    break generated;
+                }
+            };
+
+            let hash = hash_link_code(&code);
+
+            data.pending_links.insert(
+                hash,
+                PendingProducerLink {
+                    chat_id,
+                    expires_at: now + Self::LINK_TTL_SECONDS,
+                },
+            );
+
+            code
+        })
+    }
+
+    // ----------------------------------------
+    // CLAIM PRODUCER LINK
+    // ----------------------------------------
+
+    pub fn claim_link_code(&self, producer_id: &str, code: &str) -> Result<(), LinkClaimError> {
+        let producer_id = producer_id.trim();
+
+        if producer_id.is_empty()
+            || producer_id.chars().count() > 128
+            || producer_id.chars().any(|c| c.is_control())
+        {
+            return Err(LinkClaimError::InvalidProducerId);
+        }
+
+        if code.len() != 10 {
+            return Err(LinkClaimError::InvalidOrExpiredCode);
+        }
+
+        let code_hash = hash_link_code(code);
+        let now = unix_timestamp();
+
+        self.update(|data| {
+            let Some(pending) = data.pending_links.get(&code_hash).cloned() else {
+                return Err(LinkClaimError::InvalidOrExpiredCode);
+            };
+
+            if pending.expires_at <= now {
+                data.pending_links.remove(&code_hash);
+                return Err(LinkClaimError::ExpiredCode);
+            }
+
+            if data.producer_chats.contains_key(producer_id) {
+                return Err(LinkClaimError::ProducerAlreadyLinked);
+            }
+
+            if data
+                .producer_chats
+                .values()
+                .any(|chat_id| *chat_id == pending.chat_id)
+            {
+                return Err(LinkClaimError::ChatAlreadyLinked);
+            }
+
+            data.pending_links.remove(&code_hash);
+
+            // Remove any older unused tokens for this chat.
+            data.pending_links
+                .retain(|_, link| link.chat_id != pending.chat_id);
+
+            data.producer_chats
+                .insert(producer_id.to_string(), pending.chat_id);
+
+            Ok(())
+        })
+    }
+
+    // ----------------------------------------
+    // PRODUCER CONNECTION LOOKUP
+    // ----------------------------------------
+
+    pub fn producer_id_for_chat(&self, chat_id: i64) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .producer_chats
+            .iter()
+            .find_map(|(producer_id, stored_chat_id)| {
+                (*stored_chat_id == chat_id).then(|| producer_id.clone())
+            })
+    }
+
+    pub fn chat_id_for_producer(&self, producer_id: &str) -> Option<i64> {
+        self.inner
+            .lock()
+            .ok()?
+            .producer_chats
+            .get(producer_id)
+            .copied()
+    }
+
+    pub fn unlink_producer(&self, producer_id: &str) -> bool {
+        self.update(|data| data.producer_chats.remove(producer_id).is_some())
+    }
+
+    pub fn unlink_chat(&self, chat_id: i64) -> Option<String> {
+        self.update(|data| {
+            let producer_id =
+                data.producer_chats
+                    .iter()
+                    .find_map(|(producer_id, stored_chat_id)| {
+                        (*stored_chat_id == chat_id).then(|| producer_id.clone())
+                    })?;
+
+            data.producer_chats.remove(&producer_id);
+
+            Some(producer_id)
+        })
+    }
+
+    // ----------------------------------------
+    // EVENT IDEMPOTENCY
+    // ----------------------------------------
+
+    pub fn is_event_processed(&self, event_id: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|data| data.processed_events.contains_key(event_id))
+            .unwrap_or(false)
+    }
+
+    pub fn mark_event_processed(&self, event_id: &str) {
+        let now = unix_timestamp();
+
+        self.update(|data| {
+            data.processed_events.insert(event_id.to_string(), now);
+
+            data.processed_events.retain(|_, timestamp| {
+                now.saturating_sub(*timestamp) <= Self::EVENT_RETENTION_SECONDS
+            });
+
+            if data.processed_events.len() > Self::MAX_PROCESSED_EVENTS {
+                let mut oldest: Vec<(String, u64)> = data
+                    .processed_events
+                    .iter()
+                    .map(|(id, timestamp)| (id.clone(), *timestamp))
+                    .collect();
+
+                oldest.sort_by_key(|(_, timestamp)| *timestamp);
+
+                let remove_count = data.processed_events.len() - Self::MAX_PROCESSED_EVENTS;
+
+                for (id, _) in oldest.into_iter().take(remove_count) {
+                    data.processed_events.remove(&id);
+                }
+            }
+        });
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn hash_link_code(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let normalized = code.trim().to_ascii_uppercase();
+    let digest = Sha256::digest(normalized.as_bytes());
+
+    digest.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
 // ----------------------------------------
 // AUTOMATED TESTS
 // ----------------------------------------
@@ -420,6 +748,87 @@ mod tests {
             assert!(carousel.is_photo);
             assert!(carousel.favorites_view);
             assert_eq!(carousel.beats.len(), 2);
+        }
+
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod producer_notification_store_tests {
+    use super::*;
+
+    fn test_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "epsilone-producer-notifications-{}.json",
+            unix_timestamp() + rand::random::<u64>()
+        ))
+    }
+
+    #[test]
+    fn producer_link_code_is_one_time() {
+        let path = test_path();
+        let store = ProducerNotificationStore::open(path.clone());
+
+        let code = store.issue_link_code(12345);
+
+        assert!(store.claim_link_code("producer-1", &code).is_ok());
+
+        assert_eq!(store.chat_id_for_producer("producer-1"), Some(12345));
+
+        assert_eq!(
+            store.claim_link_code("producer-2", &code),
+            Err(LinkClaimError::InvalidOrExpiredCode)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_chat_cannot_link_multiple_producers() {
+        let store = ProducerNotificationStore::open(test_path());
+
+        let first_code = store.issue_link_code(12345);
+
+        assert!(store.claim_link_code("producer-1", &first_code).is_ok());
+
+        let second_code = store.issue_link_code(12345);
+
+        assert_eq!(
+            store.claim_link_code("producer-2", &second_code),
+            Err(LinkClaimError::ChatAlreadyLinked)
+        );
+    }
+
+    #[test]
+    fn producer_can_unlink() {
+        let store = ProducerNotificationStore::open(test_path());
+
+        let code = store.issue_link_code(12345);
+
+        assert!(store.claim_link_code("producer-1", &code).is_ok());
+
+        assert_eq!(store.unlink_chat(12345), Some("producer-1".to_string()));
+
+        assert_eq!(store.chat_id_for_producer("producer-1"), None);
+    }
+
+    #[test]
+    fn processed_event_survives_restart() {
+        let path = test_path();
+
+        {
+            let store = ProducerNotificationStore::open(path.clone());
+
+            store.mark_event_processed("producer-1:order-123");
+
+            assert!(store.is_event_processed("producer-1:order-123"));
+        }
+
+        {
+            let store = ProducerNotificationStore::open(path.clone());
+
+            assert!(store.is_event_processed("producer-1:order-123"));
         }
 
         let _ = fs::remove_file(path);

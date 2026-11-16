@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use std::collections::HashSet;
 use teloxide::{
     payloads::{EditMessageCaptionSetters, EditMessageMediaSetters, EditMessageTextSetters},
     prelude::Requester,
@@ -25,7 +26,10 @@ pub async fn execute_request(
     status_message_id: i32,
 ) -> HandlerResult {
     let api_result = match &request {
-        SearchRequest::Ai { query } => fetch_recommendations(state, query).await,
+        SearchRequest::Ai { query } | SearchRequest::Personalized { query } => {
+            fetch_recommendations(state, query).await
+        }
+
         SearchRequest::Trending => fetch_trending(state).await,
     };
 
@@ -35,12 +39,27 @@ pub async fn execute_request(
                 return Ok(());
             }
 
-            let exact_matches = !response.results.is_empty();
+            let is_personalized = matches!(&request, SearchRequest::Personalized { .. });
 
-            let beats = if exact_matches {
-                response.results
+            let mut exact_results = response.results;
+            let mut alternatives = response.alternatives;
+
+            if is_personalized {
+                let favorite_ids: HashSet<String> = state
+                    .favorites(chat_id)
+                    .into_iter()
+                    .map(|beat| beat.id)
+                    .collect();
+
+                exact_results = filter_personalized_beats(exact_results, &favorite_ids);
+
+                alternatives = filter_personalized_beats(alternatives, &favorite_ids);
+            }
+
+            let beats = if !exact_results.is_empty() {
+                exact_results
             } else {
-                response.alternatives
+                alternatives
             };
 
             state.cache_beat_previews(&beats);
@@ -56,12 +75,17 @@ pub async fn execute_request(
                 ) {
                     state.set_result_message_ids(chat_id, vec![status_message_id]);
 
-                    let empty_text = match request {
+                    let empty_text = match &request {
                         SearchRequest::Trending => {
                             "فعلاً بیت ترندی برای نمایش پیدا نشد. کمی بعد دوباره امتحان کن."
                         }
+
                         SearchRequest::Ai { .. } => {
                             "نتیجه‌ای برای نمایش پیدا نشد. می‌تونی جست‌وجوی دیگری انجام بدی."
+                        }
+
+                        SearchRequest::Personalized { .. } => {
+                            "✨ فعلاً بیت جدید و مناسبی بر اساس Favoriteهات پیدا نشد.\n\nچند بیت دیگر Favorite کن و دوباره امتحان کن."
                         }
                     };
 
@@ -140,6 +164,15 @@ pub async fn execute_request(
     Ok(())
 }
 
+fn filter_personalized_beats(beats: Vec<Beat>, favorite_ids: &HashSet<String>) -> Vec<Beat> {
+    let mut seen = HashSet::new();
+
+    beats
+        .into_iter()
+        .filter(|beat| !favorite_ids.contains(&beat.id) && seen.insert(beat.id.clone()))
+        .collect()
+}
+
 // ----------------------------------------
 // BEAT CAROUSEL NAVIGATION
 // ----------------------------------------
@@ -168,10 +201,45 @@ pub async fn show_adjacent_result(
 }
 
 // ----------------------------------------
+// SHOW BEATS IN THE EXISTING CAROUSEL
+// ----------------------------------------
+
+pub async fn show_beats_in_carousel(
+    bot: &teloxide::Bot,
+    chat_id: ChatId,
+    state: &AppState,
+    message_id: i32,
+    beats: Vec<Beat>,
+    favorites_view: bool,
+) -> HandlerResult {
+    if beats.is_empty() {
+        return Ok(());
+    }
+
+    state.cache_beat_previews(&beats);
+
+    if favorites_view {
+        state.set_favorite_results(chat_id, beats);
+    } else {
+        state.set_results(chat_id, beats);
+    }
+
+    state.set_state(chat_id, ConversationState::ShowingResults { message_id });
+
+    state.set_result_message_ids(chat_id, vec![message_id]);
+
+    let Some((beat, index, total)) = state.current_result(chat_id) else {
+        return Ok(());
+    };
+
+    render_carousel_beat(bot, chat_id, state, message_id, &beat, index, total).await
+}
+
+// ----------------------------------------
 // RENDER / EDIT THE SINGLE CAROUSEL MESSAGE
 // ----------------------------------------
 
-async fn render_carousel_beat(
+pub async fn render_carousel_beat(
     bot: &teloxide::Bot,
     chat_id: ChatId,
     state: &AppState,
@@ -182,7 +250,12 @@ async fn render_carousel_beat(
 ) -> HandlerResult {
     let beat_url = format!("{}/beat/{}", state.site_url, beat.id);
 
-    let keyboard = carousel_keyboard(&beat_url, state.has_cached_preview(&beat.id), total > 1);
+    let keyboard = carousel_keyboard(
+        &beat_url,
+        state.has_cached_preview(&beat.id),
+        total > 1,
+        state.is_favorite(chat_id, &beat.id),
+    );
 
     let caption = format!(
         "{}\n\n🎵 Beat {} of {}",
@@ -326,5 +399,54 @@ fn value_to_string(value: &Option<Value>) -> Option<String> {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod personalized_tests {
+    use super::*;
+
+    fn beat(id: &str) -> Beat {
+        Beat {
+            id: id.to_string(),
+            title: Some("Test Beat".to_string()),
+            producer_username: None,
+            producer_display_name: None,
+            cover_url: None,
+            preview_url: None,
+            bpm: None,
+            key: None,
+            genre: None,
+            starting_price: None,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn removes_favorite_beats() {
+        let favorites = HashSet::from(["beat-1".to_string()]);
+
+        let result = filter_personalized_beats(vec![beat("beat-1"), beat("beat-2")], &favorites);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "beat-2");
+    }
+
+    #[test]
+    fn removes_duplicate_beat_ids() {
+        let result = filter_personalized_beats(
+            vec![beat("beat-1"), beat("beat-1"), beat("beat-2")],
+            &HashSet::new(),
+        );
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn keeps_all_new_beats() {
+        let result =
+            filter_personalized_beats(vec![beat("beat-1"), beat("beat-2")], &HashSet::new());
+
+        assert_eq!(result.len(), 2);
     }
 }

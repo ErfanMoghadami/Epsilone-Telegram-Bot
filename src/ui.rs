@@ -91,6 +91,27 @@ pub async fn show_welcome_from_callback(
     let message_id = message.id;
     let keyboard = main_keyboard(site_url);
 
+    // Photo/media messages cannot be converted into text messages.
+    // Delete the old beat card and send a clean menu instead.
+    if message.caption().is_some() {
+        if let Err(error) = bot.delete_message(chat_id, message_id).send().await {
+            log::warn!(
+                "Could not delete previous beat card {}: {}",
+                message_id,
+                error
+            );
+        }
+
+        bot.send_message(chat_id, WELCOME_TEXT)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .send()
+            .await?;
+
+        return Ok(());
+    }
+
+    // Text messages can safely be edited in place.
     if message.text().is_some() {
         match bot
             .edit_message_text(chat_id, message_id, WELCOME_TEXT)
@@ -100,25 +121,17 @@ pub async fn show_welcome_from_callback(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(error) => log::warn!("Could not edit text message to menu: {}", error),
-        }
-    } else if message.caption().is_some() {
-        match bot
-            .edit_message_caption(chat_id, message_id)
-            .caption(WELCOME_TEXT)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard)
-            .send()
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => log::warn!("Could not edit media caption to menu: {}", error),
+
+            Err(error) => {
+                log::warn!("Could not edit text message to main menu: {}", error);
+            }
         }
     }
 
+    // Fallback for unsupported message types.
     bot.send_message(chat_id, WELCOME_TEXT)
         .parse_mode(ParseMode::Html)
-        .reply_markup(main_keyboard(site_url))
+        .reply_markup(keyboard)
         .send()
         .await?;
 

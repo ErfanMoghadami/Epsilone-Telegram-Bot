@@ -12,13 +12,14 @@ use teloxide::types::ChatId;
 
 use crate::{
     config::Config,
-    data::PersistentStore,
+    data::{PersistentStore, ProducerNotificationStore},
     models::{Beat, PreviewInfo},
 };
 
 #[derive(Clone, Debug)]
 pub enum SearchRequest {
     Ai { query: String },
+    Personalized { query: String },
     Trending,
 }
 
@@ -50,7 +51,7 @@ pub enum ConversationState {
 pub struct AppState {
     pub http: Client,
     pub site_url: String,
-
+    pub notifications: ProducerNotificationStore,
     persistent: PersistentStore,
 
     conversations: Arc<Mutex<HashMap<i64, ConversationState>>>,
@@ -123,6 +124,7 @@ impl AppState {
 
         let state = Self {
             http,
+            notifications: ProducerNotificationStore::from_env(),
             site_url: config.site_url,
 
             persistent,
@@ -415,6 +417,11 @@ impl AppState {
 
     /// Creates a recommendation prompt using the user's saved beats.
     /// It uses the existing /api/recommend endpoint.
+
+    // ----------------------------------------
+    // PERSONALIZED DISCOVERY QUERY
+    // ----------------------------------------
+
     pub fn personalized_query(&self, chat_id: ChatId) -> Option<String> {
         let favorites = self.favorites(chat_id);
 
@@ -423,6 +430,10 @@ impl AppState {
         }
 
         let mut genre_counts: HashMap<String, usize> = HashMap::new();
+        let mut key_counts: HashMap<String, usize> = HashMap::new();
+
+        let mut bpms: Vec<f64> = Vec::new();
+        let mut producers: HashMap<String, usize> = HashMap::new();
 
         for beat in &favorites {
             if let Some(genre) = beat.genre.as_deref() {
@@ -432,26 +443,74 @@ impl AppState {
                     *genre_counts.entry(genre.to_string()).or_default() += 1;
                 }
             }
+
+            if let Some(key) = beat.key.as_deref() {
+                let key = key.trim();
+
+                if !key.is_empty() {
+                    *key_counts.entry(key.to_string()).or_default() += 1;
+                }
+            }
+
+            if let Some(bpm) = beat.bpm.as_ref() {
+                let bpm = bpm.as_f64().or_else(|| bpm.as_str()?.parse::<f64>().ok());
+
+                if let Some(bpm) = bpm.filter(|v| *v > 0.0 && *v < 400.0) {
+                    bpms.push(bpm);
+                }
+            }
+
+            if let Some(producer) = beat.producer_username.as_deref() {
+                let producer = producer.trim();
+
+                if !producer.is_empty() {
+                    *producers.entry(producer.to_string()).or_default() += 1;
+                }
+            }
         }
 
-        let mut genres: Vec<(String, usize)> = genre_counts.into_iter().collect();
+        let mut genres: Vec<_> = genre_counts.into_iter().collect();
+        genres.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        genres.sort_by(|a, b| b.1.cmp(&a.1));
+        let preferred_genres = genres
+            .iter()
+            .take(5)
+            .map(|(name, count)| format!("{} ({})", name, count))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        let preferred_genres = if genres.is_empty() {
-            "Use the saved beat references to infer the user's preferences.".to_string()
+        let mut keys: Vec<_> = key_counts.into_iter().collect();
+        keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let preferred_keys = keys
+            .iter()
+            .take(4)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let bpm_profile = if bpms.is_empty() {
+            "Not enough BPM data".to_string()
         } else {
-            genres
-                .iter()
-                .take(5)
-                .map(|(genre, _)| genre.clone())
-                .collect::<Vec<_>>()
-                .join(", ")
+            let min = bpms.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = bpms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+            format!("{:.0}-{:.0} BPM", min, max)
         };
+
+        let mut producer_list: Vec<_> = producers.into_iter().collect();
+        producer_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let preferred_producers = producer_list
+            .iter()
+            .take(5)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let examples = favorites
             .iter()
-            .take(5)
+            .take(8)
             .map(|beat| {
                 let title = beat.title.as_deref().unwrap_or("Untitled");
                 let producer = beat.producer_username.as_deref().unwrap_or("Unknown");
@@ -462,12 +521,34 @@ impl AppState {
             .join("; ");
 
         Some(format!(
-            "Recommend new beats based on my saved favorites. \
-             My preferred genres include: {}. \
-             Some beats I saved: {}. \
+            "Create a personalized music beat discovery search \
+             using the following user preference profile.\n\
+             Preferred genres: {}.\n\
+             Preferred musical keys: {}.\n\
+             Preferred tempo range: {}.\n\
+             Frequently saved producers: {}.\n\
+             Saved beat examples: {}.\n\
              Find new beats with similar musical characteristics, \
-             but do not simply return the exact same saved beats.",
-            preferred_genres, examples
+             production style, energy and atmosphere. \
+             Treat the profile as preference signals, not strict requirements. \
+             Do not simply recommend the exact saved beats.",
+            if preferred_genres.is_empty() {
+                "Unknown"
+            } else {
+                &preferred_genres
+            },
+            if preferred_keys.is_empty() {
+                "Unknown"
+            } else {
+                &preferred_keys
+            },
+            bpm_profile,
+            if preferred_producers.is_empty() {
+                "Unknown"
+            } else {
+                &preferred_producers
+            },
+            examples
         ))
     }
 
